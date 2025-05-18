@@ -12,6 +12,8 @@ from torch.utils import data
 import warnings
 from federated_learning.network_training import local_update, local_update_scaffold, \
     local_update_scaffold_notransfer,local_update_shap, local_update_fedprox, train_net,train_net_fedavg  
+from pruning import apply_random_pruning, apply_magnitude_pruning, apply_grad_x_input_pruning, apply_classwise_shap_pruning, apply_entropy_pruning
+
 from utils.load_neural_networks import init_nets
 from utils.log_utils import mkdirs
 from utils.parameters import get_parameter
@@ -139,14 +141,12 @@ def evaluate_global_model(global_model, args, device, logger):
 
 
 def run_fedavg(args, device, logger, net_dataidx_map, test_dl_global):
+    logger.info("Initializing nets")
     
-    logger.info("Initializing nets for FedAvg")
-    nets, _, _ = init_nets(args.n_parties, args.model, args)
-    global_models, _, _ = init_nets(1, args.model, args)
+    nets, local_model_meta_data, layer_type = init_nets(args.n_parties, args.model, args)
+    global_models, global_model_meta_data, global_layer_type = init_nets(1, args.model, args)
     global_model = global_models[0]
     global_para = global_model.module.encoder.state_dict()
-    successful_rounds = 0
-
 
     if args.is_same_initial:
         for net_id, net in nets.items():
@@ -154,87 +154,75 @@ def run_fedavg(args, device, logger, net_dataidx_map, test_dl_global):
 
     t_start = time.time()
     lr = args.lr
-    achieved_target = False
-
-    tracker = MetricsTracker(num_rounds=args.comm_round, log_dir=args.logdir)
 
     for round in range(args.comm_round):
-        tracker.rounds_completed += 1 ;
-        if achieved_target:
-            break
-
-        tracker.start_round()
         logger.info(f"[FedAvg] in comm round: {round} " + "#" * 100)
 
-        selected = np.random.choice(range(args.n_parties), int(args.n_parties * args.sample), replace=False)
+        # Select clients
+        arr = np.arange(args.n_parties)
+        np.random.shuffle(arr)
+        selected = arr[:int(args.n_parties * args.sample)]
 
+        # Sync global weights to selected clients
         for idx in selected:
             nets[idx].module.encoder.load_state_dict(global_para)
 
-        client_accs = []
-        client_deltas = []
+        # Client-side local update (no pruning yet)
+        prune_flag = False
+        local_update(nets, selected, args, net_dataidx_map, logger, lr, test_dl=None, device=device, Prune=prune_flag)
 
-        train_dl, test_dl, *_ = get_dataloader_from_map(args, net_dataidx_map, idx)
-
-        for k in nets:
-            nets[k] = nets[k].to(device)
-
-
+        # Apply pruning (if specified)
         for idx in selected:
-            train_acc, test_acc, pre_train_acc, pre_test_acc = train_net_fedavg(
-                idx, nets[idx], train_dl, test_dl, args.epochs, lr, args.optimizer, logger, args
-            )
+            net = nets[idx]
+            if args.pruning == "random":
+                net = apply_random_pruning(net, prune_ratio=args.prune_ratio, logger=logger)
+            elif args.pruning == "magnitude":
+                net = apply_magnitude_pruning(net, prune_ratio=args.prune_ratio, logger=logger)
+            elif args.pruning == "gradxinput":
+                net = apply_grad_x_input_pruning(net, local_train_dl_all[idx], device, prune_ratio=args.prune_ratio, logger=logger)
+            elif args.pruning == "shap":
+                net = apply_shap_pruning(net, local_train_dl_all[idx], device, prune_ratio=args.prune_ratio, logger=logger)  # if implemented
+            elif args.pruning == "classwise_shap":
+                net = apply_classwise_shap_pruning(net, local_train_dl_all[idx], device, prune_ratio=args.prune_ratio, num_classes=args.num_classes, logger=logger)
+            elif args.pruning == "entropy":
+                net = apply_entropy_pruning(net, local_train_dl_all[idx], device, prune_ratio=args.prune_ratio, logger=logger)
+            else:
+                logger.info(f"[FedAvg] No pruning applied for client {idx}")
 
-          
+        lr *= 0.99  # Learning rate decay
 
-            client_accs.append(test_acc)
-
-            local_para = nets[idx].module.encoder.state_dict()
-            delta = {k: (local_para[k] - global_para[k].to(local_para[k].device)) for k in global_para}
-            flat_delta = torch.cat([v.flatten() for v in delta.values()]).detach()
-            client_deltas.append(flat_delta.cpu().numpy())
-
-        client_drift = [np.linalg.norm(delta) for delta in client_deltas]
-        tracker.update_client_metrics(client_accs=client_accs, client_drift=client_drift)
-
-
-        total_data_points = sum(len(net_dataidx_map[r]) for r in selected)
+        # FedAvg Aggregation
+        total_data_points = sum([len(net_dataidx_map[r]) for r in selected])
         fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in selected]
 
-        for i, idx in enumerate(selected):
-            local_para = nets[idx].cpu().module.encoder.state_dict()
-            if i == 0:
-                for key in global_para:
-                    global_para[key] = local_para[key] * fed_avg_freqs[i]
+        for idx, client_id in enumerate(selected):
+            net_para = nets[client_id].cpu().module.encoder.state_dict()
+            if idx == 0:
+                for key in net_para:
+                    global_para[key] = net_para[key] * fed_avg_freqs[idx]
             else:
-                for key in global_para:
-                    global_para[key] += local_para[key] * fed_avg_freqs[i]
+                for key in net_para:
+                    global_para[key] += net_para[key] * fed_avg_freqs[idx]
 
         global_model.module.encoder.load_state_dict(global_para)
-        acc, top5 = compute_acc(test_dl_global, device, global_model, nn.CrossEntropyLoss())
-        tracker.update_global_metrics(acc, top5)
 
-        logger.info(f"[FedAvg] Round accuracy {acc:.2f}% at round {round}.")
-
-        if acc >= args.target_acc:
-            successful_rounds += 1
-            logger.info(f"[FedAvg] Target accuracy {args.target_acc:.2f}% reached at round {round} ({successful_rounds}/3).")
-        else:
-            successful_rounds = 0  
-        
-        if successful_rounds >= 3:
-            logger.info(f"[FedAvg] Target accuracy sustained for 3 rounds. Stopping.")
-            achieved_target = True
-
-
-        tracker.end_round()
+        # Communication cost logging
+        round_comm_cost = sum(compute_comm_cost(nets[idx], sparse=False) for idx in selected)
+        avg_comm_cost = round_comm_cost / len(selected)
+        logger.info(f"[Round {round}] Avg Communication Cost (client → server): {avg_comm_cost:.2f} MB")
 
     t_end = time.time()
-    tracker.finalize(final_accuracy=acc)
-    tracker.save_summary()
+    logger.info("total communication time: %f" % (t_end - t_start))
+    logger.info("avg time per round: %f" % ((t_end - t_start) / args.comm_round))
 
-    logger.info("total communication time: %.2f seconds" % (t_end - t_start))
-    logger.info("avg time per round: %.2f seconds" % ((t_end - t_start) / tracker.rounds_completed))
+    # Save final model
+    checkpoint_dir = os.path.join(args.logdir, "checkpoint")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    final_model_path = os.path.join(checkpoint_dir, "global_model_final.pth")
+    torch.save(global_model.state_dict(), final_model_path)
+    logger.info(f"Saved final global model to {final_model_path}")
+    assert os.path.exists(final_model_path), f"Checkpoint file not saved: {final_model_path}"
+
 
 
 def run_fedprox(args, device, logger, net_dataidx_map, test_dl_global):
