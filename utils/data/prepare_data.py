@@ -445,7 +445,7 @@ def get_dataloader(dataset, datadir, train_bs, test_bs, dataidxs=None, noise_lev
             batch_size=train_bs,
             shuffle=True,
             drop_last=False,
-            num_workers=16,
+            num_workers=8,
             persistent_workers=True,
             pin_memory=True
         )
@@ -455,7 +455,7 @@ def get_dataloader(dataset, datadir, train_bs, test_bs, dataidxs=None, noise_lev
             batch_size=test_bs,
             shuffle=False,
             drop_last=False,
-            num_workers=16,
+            num_workers=8,
             persistent_workers=True,
             pin_memory=True
         )
