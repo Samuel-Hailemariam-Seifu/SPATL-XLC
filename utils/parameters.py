@@ -23,6 +23,16 @@ def get_parameter():
     parser.add_argument('--target_acc', type=float, default=85.0, help='Stop training if accuracy reaches this threshold')
     parser.add_argument('--reg', type=float, default=1e-5, help='L2 regularization strength')
 
+    parser.add_argument('--pruning', type=str, default='none', 
+                    choices=['none', 'random', 'magnitude', 'gradxinput', 'shap', 'classwise_shap', 'entropy'],
+                    help='Pruning strategy to use.')
+
+    parser.add_argument('--prune_ratio', type=float, default=0.2, 
+                    help='Fraction of weights to prune per round.')
+
+    parser.add_argument('--num_classes', type=int, default=10, 
+                    help='Number of classes in the dataset (needed for classwise SHAP).')
+
 
     # parser.add_argument('--f_epochs', default=20, type=int, help='Fast fine-tuning epochs.')
 
