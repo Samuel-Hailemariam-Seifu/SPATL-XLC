@@ -12,3 +12,6 @@ from 30% to 89% and reduces the training time by 13% while maintaining practical
 the communication cost slightly increases, the method delivers a clearer and more stable explanation with a
 reduced per-round bandwidth, making it well-suited for real-world FL applications in which explainability
 and efficiency are critical.
+
+
+<img width="727" height="560" alt="image" src="https://github.com/user-attachments/assets/0fbe053a-d067-4858-8a43-7d2174f8cd20" />
